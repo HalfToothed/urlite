@@ -7,7 +7,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/halftoothed/urlite/internal/handlers"
+	"github.com/halftoothed/urlite/internal/middleware"
 	"github.com/halftoothed/urlite/internal/models"
+	"github.com/halftoothed/urlite/internal/redis"
 	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -25,6 +27,8 @@ func init() {
 func main() {
 
 	var err error
+
+	redis.InitRedis()
 
 	// Databse Initialization
 	dbHost := os.Getenv("DB_HOST")
@@ -56,6 +60,7 @@ func main() {
 	// GIN Setup
 	router := gin.Default()
 
+	router.Use(middleware.RateLimiter())
 	router.POST("/shorten", handlers.ShortenURL(db))
 	router.GET("/:code", handlers.ResolveURL(db))
 
