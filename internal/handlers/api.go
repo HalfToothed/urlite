@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"errors"
+	"log"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -8,12 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/halftoothed/urlite/internal/models"
+	"github.com/halftoothed/urlite/internal/redis"
 	"gorm.io/gorm"
 )
-
-type shortenRequest struct {
-	URL string `json:"url" binding:"required"`
-}
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -30,7 +29,7 @@ func ShortenURL(db *gorm.DB) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 
-		var req shortenRequest
+		var req models.ShortenRequest
 
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
@@ -41,14 +40,30 @@ func ShortenURL(db *gorm.DB) gin.HandlerFunc {
 		for {
 			shortCode = generateShortCode(6)
 			var existing models.Url
-			if err := db.Where("short_code = ?", shortCode).First(&existing).Error; err == gorm.ErrRecordNotFound {
+			if err := db.Where("short_code = ?", shortCode).First(&existing).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 				break // unique
 			}
+		}
+
+		var expires_at *time.Time
+
+		if req.TTL != "" {
+			duration, err := time.ParseDuration(req.TTL)
+
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid TTL"})
+			}
+
+			t := time.Now().Add(duration)
+
+			expires_at = &t
+
 		}
 
 		newUrl := models.Url{
 			ShortCode: shortCode,
 			LongURL:   req.URL,
+			ExpiresAt: expires_at,
 		}
 
 		if err := db.Create(&newUrl).Error; err != nil {
@@ -66,11 +81,34 @@ func ResolveURL(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 
 		code := c.Param("code")
+		key := "shorturl:" + code
+
+		val, err := redis.Rdb.Get(redis.Ctx, key).Result()
+
+		if err == nil {
+			// Cache hit — redirect
+			c.Redirect(http.StatusFound, val)
+			return
+		}
 
 		var url models.Url
 		if err := db.Where("short_code = ?", code).First(&url).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Short URL is not found"})
 			return
+		}
+
+		log.Println(url.ExpiresAt)
+
+		if url.ExpiresAt != nil && url.ExpiresAt.Before(time.Now()) {
+			// Optional: remove from Redis
+			redis.Rdb.Del(redis.Ctx, key)
+			c.JSON(http.StatusGone, gin.H{"error": "URL has expired"})
+			return
+		}
+
+		err = redis.Rdb.Set(redis.Ctx, key, url.LongURL, time.Hour).Err()
+		if err != nil {
+			log.Println("Failed to cache in Redis:", err)
 		}
 
 		c.Redirect(http.StatusFound, url.LongURL)
